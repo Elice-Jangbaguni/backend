@@ -733,83 +733,6 @@ def create_group_buy(
             product_image.file.close()
 
 
-@app.get("/api/group_buy/{buy_id}")
-def get_group_buy_detail(buy_id: int,user_id: int = Depends(get_current_user_id)
-):
-    conn = None
-
-    try:
-        conn = get_connection()
-
-        with conn.cursor(DictCursor) as cursor:
-
-            # 공동구매 글 상세 정보 조회
-            cursor.execute("""
-                SELECT
-                    f.buy_id,
-                    f.user_id,
-                    f.region,
-                    f.product_name,
-                    f.product_image_path,
-                    f.price,
-                    f.place,
-                    f.number_of_people,
-                    f.description,
-                    f.uploaded_date,
-                    f.status,
-
-                    (
-                        SELECT COUNT(*)
-                        FROM group_buy AS p
-                        WHERE p.buy_id = f.buy_id
-                    ) AS current_people,
-
-                    EXISTS (
-                        SELECT 1
-                        FROM group_buy AS p
-                        WHERE p.buy_id = f.buy_id
-                          AND p.user_id = %s
-                    ) AS is_participating
-
-                FROM group_buy_feed AS f
-                WHERE f.buy_id = %s
-            """, (user_id, buy_id))
-
-            post = cursor.fetchone()
-
-            if post is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="공동구매 글을 찾을 수 없습니다."
-                )
-
-            # 작성자 여부
-            post["is_owner"] = (
-                post["user_id"] == user_id
-            )
-
-            # 참여 여부를 boolean으로 변환
-            post["is_participating"] = bool(
-                post["is_participating"]
-            )
-
-        return post
-
-    except HTTPException:
-        raise
-
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="공동구매 상세 조회 중 오류가 발생했습니다."
-        )
-
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-
 @app.put("/api/group_buy/{buy_id}")
 def update_group_buy(
     buy_id: int,
@@ -1044,6 +967,83 @@ def get_my_group_buys(    user_id: int = Depends(get_current_user_id)):
     finally:
         if conn is not None:
             conn.close()
+
+@app.get("/api/group_buy/{buy_id}")
+def get_group_buy_detail(buy_id: int,user_id: int = Depends(get_current_user_id)
+):
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+
+            # 공동구매 글 상세 정보 조회
+            cursor.execute("""
+                SELECT
+                    f.buy_id,
+                    f.user_id,
+                    f.region,
+                    f.product_name,
+                    f.product_image_path,
+                    f.price,
+                    f.place,
+                    f.number_of_people,
+                    f.description,
+                    f.uploaded_date,
+                    f.status,
+
+                    (
+                        SELECT COUNT(*)
+                        FROM group_buy AS p
+                        WHERE p.buy_id = f.buy_id
+                    ) AS current_people,
+
+                    EXISTS (
+                        SELECT 1
+                        FROM group_buy AS p
+                        WHERE p.buy_id = f.buy_id
+                          AND p.user_id = %s
+                    ) AS is_participating
+
+                FROM group_buy_feed AS f
+                WHERE f.buy_id = %s
+            """, (user_id, buy_id))
+
+            post = cursor.fetchone()
+
+            if post is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="공동구매 글을 찾을 수 없습니다."
+                )
+
+            # 작성자 여부
+            post["is_owner"] = (
+                post["user_id"] == user_id
+            )
+
+            # 참여 여부를 boolean으로 변환
+            post["is_participating"] = bool(
+                post["is_participating"]
+            )
+
+        return post
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="공동구매 상세 조회 중 오류가 발생했습니다."
+        )
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 
 @app.post("/api/group_buy/{buy_id}/participants", status_code=201)
 def join_group_buy(buy_id: int,    user_id: int = Depends(get_current_user_id)
