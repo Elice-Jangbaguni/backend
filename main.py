@@ -25,11 +25,16 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 app = FastAPI(title="장바구니 API")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="장바구니 API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://jangbaguni-web.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
