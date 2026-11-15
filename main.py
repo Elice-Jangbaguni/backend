@@ -15,15 +15,26 @@ from pymysql.err import IntegrityError
 
 import shutil
 import asyncio
-
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import jwt
 from fastapi.staticfiles import StaticFiles
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 
 app = FastAPI(title="장바구니 API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 Path("uploads").mkdir(parents=True, exist_ok=True)
 
@@ -1974,10 +1985,8 @@ def signup(request: SignupRequest):
             detail="이미 등록된 아이디 또는 이메일입니다."
         )
 
-    except Exception:
-        if conn is not None:
-            conn.rollback()
-
+    except Exception as e:
+        print("회원가입 오류:", repr(e))
         raise HTTPException(
             status_code=500,
             detail="회원가입 중 오류가 발생했습니다."
