@@ -2085,6 +2085,11 @@ def login(request: LoginRequest):
         if conn is not None:
             conn.close()
 
+@app.post("/api/auth/logout")
+def logout(user_id: int = Depends(get_current_user_id)):
+    return {
+        "message": "로그아웃 성공"
+    }
 
 @app.get("/api/auth/me")
 def get_my_info(
