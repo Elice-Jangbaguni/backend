@@ -673,6 +673,15 @@ def create_group_buy(
 
             buy_id = cursor.lastrowid
 
+            # 작성 시간 조회
+            cursor.execute("""
+                SELECT uploaded_date
+                FROM group_buy_feed
+                WHERE buy_id = %s
+            """, (buy_id,))
+
+            uploaded_date = cursor.fetchone()["uploaded_date"]
+
             # 4. 작성자도 참여자로 등록
             cursor.execute("""
                 INSERT INTO group_buy (
@@ -695,7 +704,8 @@ def create_group_buy(
             "number_of_people": number_of_people,
             "current_people": 1,
             "description": description,
-            "status": "recruiting"
+            "status": "recruiting",
+            "uploaded_date": uploaded_date.isoformat()
         }
 
     except HTTPException:
