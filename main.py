@@ -1906,6 +1906,36 @@ class SignupRequest(BaseModel):
     email: Optional[EmailStr] = None
 
 
+@app.get("/api/auth/check-username")
+def check_username(username: str):
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+            cursor.execute("""
+                SELECT user_id
+                FROM users
+                WHERE username = %s
+            """, (username,))
+
+            user = cursor.fetchone()
+
+        return {
+            "available": user is None
+        }
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="아이디 중복 확인 중 오류가 발생했습니다."
+        )
+
+    finally:
+        if conn is not None:
+            conn.close()
+
 @app.post("/api/auth/signup", status_code=201)
 def signup(request: SignupRequest):
     conn = None
