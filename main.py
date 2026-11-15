@@ -27,7 +27,6 @@ app = FastAPI(title="장바구니 API")
 
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="장바구니 API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1904,7 +1903,7 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     birth: date
     gender: str
-    email: EmailStr
+    email: Optional[EmailStr] = None
 
 
 @app.post("/api/auth/signup", status_code=201)
@@ -1930,17 +1929,18 @@ def signup(request: SignupRequest):
                 )
 
             # 2. 이메일 중복 확인
-            cursor.execute("""
-                SELECT user_id
-                FROM users
-                WHERE email = %s
-            """, (request.email,))
+            if request.email is not None:
+                cursor.execute("""
+                    SELECT user_id
+                    FROM users
+                    WHERE email = %s
+                """, (request.email,))
 
-            if cursor.fetchone() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="이미 사용 중인 이메일입니다."
-                )
+                if cursor.fetchone() is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="이미 사용 중인 이메일입니다."
+                    )
 
             # 3. 비밀번호 해시 생성
             hashed_password = password_hash.hash(
