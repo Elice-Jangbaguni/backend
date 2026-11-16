@@ -983,6 +983,7 @@ def get_group_buy_detail(buy_id: int,user_id: int = Depends(get_current_user_id)
                 SELECT
                     f.buy_id,
                     f.user_id,
+                    f.username,
                     f.region,
                     f.product_name,
                     f.product_image_path,
@@ -1007,6 +1008,8 @@ def get_group_buy_detail(buy_id: int,user_id: int = Depends(get_current_user_id)
                     ) AS is_participating
 
                 FROM group_buy_feed AS f
+                JOIN users AS u
+                    ON f.user_id = u.user_id
                 WHERE f.buy_id = %s
             """, (user_id, buy_id))
 
@@ -1204,17 +1207,19 @@ def get_chat_messages(buy_id: int,user_id: int = Depends(get_current_user_id)):
             # 3. 채팅 메시지 조회
             cursor.execute("""
                 SELECT
-                    message_id,
-                    buy_id,
-                    user_id,
-                    message,
-                    image_path,
-                    sent_time
-                FROM group_buy_chat
-                WHERE buy_id = %s
-                ORDER BY sent_time ASC, message_id ASC
+                    c.message_id,
+                    c.buy_id,
+                    c.user_id,
+                    u.username,
+                    c.message,
+                    c.image_path,
+                    c.sent_time
+                FROM group_buy_chat AS c
+                JOIN users AS u
+                    ON c.user_id = u.user_id
+                WHERE c.buy_id = %s
+                ORDER BY c.sent_time ASC, c.message_id ASC
             """, (buy_id,))
-
             messages = cursor.fetchall()
 
         return {
@@ -1347,14 +1352,17 @@ def send_chat_message(
             # 6. 저장된 메시지 조회
             cursor.execute("""
                 SELECT
-                    message_id,
-                    buy_id,
-                    user_id,
-                    message,
-                    image_path,
-                    sent_time
-                FROM group_buy_chat
-                WHERE message_id = %s
+                    c.message_id,
+                    c.buy_id,
+                    c.user_id,
+                    u.username,
+                    c.message,
+                    c.image_path,
+                    c.sent_time
+                FROM group_buy_chat AS c
+                JOIN users AS u
+                    ON c.user_id = u.user_id
+                WHERE c.message_id = %s
             """, (message_id,))
 
             saved_message = cursor.fetchone()
@@ -1548,14 +1556,17 @@ async def group_buy_websocket(
 
                         cursor.execute("""
                             SELECT
-                                message_id,
-                                buy_id,
-                                user_id,
-                                message,
-                                image_path,
-                                sent_time
-                            FROM group_buy_chat
-                            WHERE message_id = %s
+                                c.message_id,
+                                c.buy_id,
+                                c.user_id,
+                                u.username,
+                                c.message,
+                                c.image_path,
+                                c.sent_time
+                            FROM group_buy_chat AS c
+                            JOIN users AS u
+                                ON c.user_id = u.user_id
+                            WHERE c.message_id = %s
                         """, (message_id,))
 
                         saved_message = cursor.fetchone()
