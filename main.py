@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 from pwdlib import PasswordHash
 from pymysql.err import IntegrityError
-
+from fastapi import Response
 import shutil
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
@@ -2185,3 +2185,81 @@ def verify_websocket_token(token: str):
 
     except (jwt.InvalidTokenError, KeyError, ValueError, TypeError):
         return None
+
+
+@app.delete("/api/group_buy/{buy_id}", status_code=204)
+def delete_group_buy(
+    buy_id: int,
+    user_id: int = Depends(get_current_user_id)
+):
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+
+            # 1. 게시글 조회
+            cursor.execute("""
+                SELECT user_id
+                FROM group_buy_feed
+                WHERE buy_id = %s
+                FOR UPDATE
+            """, (buy_id,))
+
+            post = cursor.fetchone()
+
+            if post is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="공동구매 글을 찾을 수 없습니다."
+                )
+
+            # 2. 작성자만 삭제 가능
+            if post["user_id"] != user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="작성자만 공동구매 글을 삭제할 수 있습니다."
+                )
+
+            # 3. 채팅 메시지 삭제
+            cursor.execute("""
+                DELETE FROM group_buy_chat
+                WHERE buy_id = %s
+            """, (buy_id,))
+
+            # 4. 참여자 정보 삭제
+            cursor.execute("""
+                DELETE FROM group_buy
+                WHERE buy_id = %s
+            """, (buy_id,))
+
+            # 5. 공동구매 게시글 삭제
+            cursor.execute("""
+                DELETE FROM group_buy_feed
+                WHERE buy_id = %s
+            """, (buy_id,))
+
+        conn.commit()
+
+        return Response(status_code=204)
+
+    except HTTPException:
+        if conn is not None:
+            conn.rollback()
+        raise
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+
+        print("공동구매 글 삭제 오류:", repr(e), flush=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="공동구매 글 삭제 중 오류가 발생했습니다."
+        )
+
+    finally:
+        if conn is not None:
+            conn.close()
