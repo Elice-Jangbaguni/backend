@@ -983,7 +983,7 @@ def get_group_buy_detail(buy_id: int,user_id: int = Depends(get_current_user_id)
                 SELECT
                     f.buy_id,
                     f.user_id,
-                    f.username,
+                    u.username,
                     f.region,
                     f.product_name,
                     f.product_image_path,
