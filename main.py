@@ -2513,9 +2513,8 @@ async def upload_receipt(
         "ocr_result": ocr_result
     }
 
-@app.post("/api/products/{temp_id}/product_date_ocr")
+@app.post("/api/products/product_date_ocr")
 async def product_date_ocr(
-    temp_id: int,
     file: UploadFile = File(...),
     user_id: int = Depends(get_current_user_id)
 ):
@@ -2556,12 +2555,11 @@ async def product_date_ocr(
             detail=str(e)
         )
 
-    # 4. OCR 결과에서 날짜 추출
+    # 4. 소비기한 추출
     product_date = extract_product_date(ocr_result)
 
     # 5. 결과 반환
     return {
-        "temp_id": temp_id,
         "product_date": product_date
     }
 
