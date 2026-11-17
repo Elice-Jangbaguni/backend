@@ -79,7 +79,7 @@ class ProductRegisterRequest(BaseModel):
 
 def call_clova_ocr(image_data: bytes, filename: str):
 
-    secret_key = os.getenv("CLOVA_OCR_SECRET_KEY")
+    secret_key = os.getenv("CLOVA_OCR_SECRET_KEY", "").strip()    
     invoke_url = os.getenv("CLOVA_OCR_INVOKE_URL")
 
     if not secret_key or not invoke_url:

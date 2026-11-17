@@ -1,3 +1,20 @@
+---
+name: ISSUE_TEMPLATE
+about: Describe this issue template's purpose here.
+title: ''
+labels: ''
+assignees: ''
+
+---
+
+name: Default Template
+about: Suggest an idea for this project
+title: "[유형] 설명"
+labels: ''
+assignees: ''
+
+---
+
 - [ ] Issue 유형 선택(제목, Label 설정)
 - [ ] 요청 사항 설명
 
