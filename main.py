@@ -2512,6 +2512,59 @@ async def upload_receipt(
         "texts": texts,
         "ocr_result": ocr_result
     }
+
+@app.post("/api/products/{temp_id}/product_date_ocr")
+async def product_date_ocr(
+    temp_id: int,
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id)
+):
+    # 1. 이미지 형식 확인
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        raise HTTPException(
+            status_code=400,
+            detail="JPG 또는 PNG 이미지만 업로드할 수 있습니다."
+        )
+
+    # 2. 이미지 읽기
+    image_data = await file.read()
+
+    if not image_data:
+        raise HTTPException(
+            status_code=400,
+            detail="이미지 파일이 비어 있습니다."
+        )
+
+    # 3. CLOVA OCR 호출
+    try:
+        ocr_result = call_clova_ocr(
+            image_data,
+            file.filename or "product.jpg"
+        )
+
+    except requests.exceptions.RequestException as e:
+        print("소비기한 OCR 요청 오류:", repr(e), flush=True)
+        raise HTTPException(
+            status_code=502,
+            detail="소비기한 OCR 호출에 실패했습니다."
+        )
+
+    except (ValueError, RuntimeError) as e:
+        print("소비기한 OCR 오류:", repr(e), flush=True)
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    # 4. OCR 결과에서 날짜 추출
+    product_date = extract_product_date(ocr_result)
+
+    # 5. 결과 반환
+    return {
+        "temp_id": temp_id,
+        "product_date": product_date
+    }
+
 def extract_receipt_items(ocr_result):
     items = []
 
@@ -2620,3 +2673,43 @@ def extract_receipt_items(ocr_result):
             })
 
     return items
+
+def extract_product_date(ocr_result):
+    texts = []
+
+    # OCR 결과에서 텍스트 추출
+    for image in ocr_result.get("images", []):
+        for field in image.get("fields", []):
+            text = field.get("inferText", "").strip()
+            if text:
+                texts.append(text)
+
+    # 날짜가 여러 OCR 조각으로 나뉜 경우도 고려
+    full_text = " ".join(texts)
+
+    # 날짜 패턴 검색
+    patterns = [
+        r"(?<!\d)(20\d{2})[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})(?:일)?(?!\d)",
+        r"(?<!\d)(\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})(?!\d)"
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, full_text)
+
+        for year, month, day in matches:
+            year = int(year)
+            month = int(month)
+            day = int(day)
+
+            # 두 자리 연도 처리 (예: 26 → 2026)
+            if year < 100:
+                year += 2000
+
+            try:
+                parsed_date = date(year, month, day)
+            except ValueError:
+                continue
+
+            return parsed_date.isoformat()
+
+    return None
