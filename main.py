@@ -7,6 +7,10 @@ from fastapi import FastAPI, HTTPException, Form, File, UploadFile, Depends
 from pydantic import BaseModel, Field, EmailStr
 from pymysql.cursors import DictCursor
 
+import uuid
+import json
+import requests
+
 from database import get_connection
 from pathlib import Path
 from uuid import uuid4
@@ -72,6 +76,59 @@ class ProductItem(BaseModel):
 class ProductRegisterRequest(BaseModel):
     receipt_id: int
     products: list[ProductItem] = Field(min_length=1)
+
+def call_clova_ocr(image_data: bytes, filename: str):
+
+    secret_key = os.getenv("CLOVA_OCR_SECRET_KEY")
+    invoke_url = os.getenv("CLOVA_OCR_INVOKE_URL")
+
+    if not secret_key or not invoke_url:
+        raise RuntimeError("CLOVA OCR 환경변수가 설정되지 않았습니다.")
+
+    # 이미지 확장자 확인
+    extension = filename.rsplit(".", 1)[-1].lower()
+
+    if extension == "jpeg":
+        extension = "jpg"
+
+    if extension not in ["jpg", "png"]:
+        raise ValueError("JPG 또는 PNG 이미지만 지원합니다.")
+
+    # CLOVA OCR 요청 정보
+    request_json = {
+        "version": "V2",
+        "requestId": str(uuid.uuid4()),
+        "timestamp": int(__import__("time").time() * 1000),
+        "images": [
+            {
+                "format": extension,
+                "name": "receipt"
+            }
+        ]
+    }
+
+    # CLOVA OCR API 호출
+    response = requests.post(
+        invoke_url,
+        headers={
+            "X-OCR-SECRET": secret_key
+        },
+        data={
+            "message": json.dumps(request_json)
+        },
+        files={
+            "file": (
+                filename,
+                image_data,
+                "image/jpeg" if extension == "jpg" else "image/png"
+            )
+        },
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    return response.json()
 
 
 def get_test_user_id(cursor):
@@ -146,7 +203,7 @@ def home():
     return {"message": "장바구니 백엔드 서버 실행 성공"}
 
 
-@app.get("/products")
+@app.get("/api/products")
 def get_products(
     user_id: int = Depends(get_current_user_id)
 ):
@@ -178,7 +235,9 @@ def get_products(
             "products": products
         }
 
-    except Exception:
+    except Exception as e:
+        print("상품 목록 조회 오류:", repr(e), flush=True)
+
         raise HTTPException(
             status_code=500,
             detail="상품 목록 조회 중 오류가 발생했습니다."
@@ -2274,3 +2333,64 @@ def delete_group_buy(
     finally:
         if conn is not None:
             conn.close()
+
+@app.post("/api/receipts/upload")
+async def upload_receipt(
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id)
+):
+    # 1. 이미지 파일 확인
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        raise HTTPException(
+            status_code=400,
+            detail="JPG 또는 PNG 이미지만 업로드할 수 있습니다."
+        )
+
+    # 2. 이미지 읽기
+    image_data = await file.read()
+
+    if not image_data:
+        raise HTTPException(
+            status_code=400,
+            detail="이미지 파일이 비어 있습니다."
+        )
+
+    # 3. CLOVA OCR 호출
+    try:
+        ocr_result = call_clova_ocr(
+            image_data,
+            file.filename or "receipt.jpg"
+        )
+
+    except requests.exceptions.RequestException as e:
+        print("CLOVA OCR 요청 오류:", repr(e), flush=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail="CLOVA OCR 호출에 실패했습니다."
+        )
+
+    except (ValueError, RuntimeError) as e:
+        print("OCR 설정 또는 파일 오류:", repr(e), flush=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="OCR 처리 중 오류가 발생했습니다."
+        )
+
+    # 4. OCR 인식 텍스트 추출
+    texts = []
+
+    for image in ocr_result.get("images", []):
+        for field in image.get("fields", []):
+            text = field.get("inferText", "")
+
+            if text:
+                texts.append(text)
+
+    # 5. 결과 반환
+    return {
+        "user_id": user_id,
+        "texts": texts,
+        "ocr_result": ocr_result
+    }
