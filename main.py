@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile, Depends
 from pydantic import BaseModel, Field, EmailStr
 from pymysql.cursors import DictCursor
-
+import re
 import uuid
 import json
 import requests
@@ -2388,9 +2388,123 @@ async def upload_receipt(
             if text:
                 texts.append(text)
 
-    # 5. 결과 반환
+    # 5. 상품명과 수량 추출
+    items = extract_receipt_items(ocr_result)
+
+    # 6. 결과 반환
     return {
         "user_id": user_id,
+        "total": len(items),
+        "items": items,
         "texts": texts,
         "ocr_result": ocr_result
     }
+
+def extract_receipt_items(ocr_result):
+    items = []
+
+    for image in ocr_result.get("images", []):
+        fields = image.get("fields", [])
+        rows = []
+
+        # 1. OCR 텍스트와 위치 추출
+        for field in fields:
+            text = field.get("inferText", "").strip()
+            vertices = field.get("boundingPoly", {}).get("vertices", [])
+
+            if not text or not vertices:
+                continue
+
+            x = sum(v["x"] for v in vertices) / len(vertices)
+            y = sum(v["y"] for v in vertices) / len(vertices)
+
+            rows.append({
+                "text": text,
+                "x": x,
+                "y": y
+            })
+
+        # 2. 위에서 아래로 정렬
+        rows.sort(key=lambda r: r["y"])
+
+        # 3. 같은 행의 글자 묶기
+        grouped_rows = []
+
+        for row in rows:
+            if (
+                grouped_rows
+                and abs(grouped_rows[-1][0]["y"] - row["y"]) < 12
+            ):
+                grouped_rows[-1].append(row)
+            else:
+                grouped_rows.append([row])
+
+        excluded = {
+            "제품명", "상품명", "수량", "금액",
+            "할인금액", "(할인금액)", "(할인내역)",
+            "과세금액", "부가세", "총매출액",
+            "합계금액", "받은금액", "결제금액",
+            "합계", "합계수량"
+        }
+
+        # 4. 상품명과 수량 추출
+        for group in grouped_rows:
+            group.sort(key=lambda r: r["x"])
+
+            texts = [r["text"] for r in group]
+
+            # 합계, 결제 등 불필요한 행 제외
+            if any(text in excluded for text in texts):
+                continue
+
+            # 문자와 숫자가 함께 있는 상품명 후보
+            name_candidates = [
+                r for r in group
+                if re.search(r"[가-힣a-zA-Z]", r["text"])
+            ]
+
+            if not name_candidates:
+                continue
+
+            product = name_candidates[0]
+            product_name = product["text"]
+
+            # 상품명 오른쪽에서 수량 후보 찾기
+            quantity_candidates = [
+                r for r in group
+                if (
+                    r["x"] > product["x"]
+                    and re.fullmatch(r"\d+", r["text"])
+                )
+            ]
+
+            # 숫자가 여러 개라면 가장 가까운 숫자를 후보로 사용
+            quantity_candidates.sort(
+                key=lambda r: r["x"]
+            )
+
+            quantity = None
+
+            if quantity_candidates:
+                quantity = int(quantity_candidates[0]["text"])
+
+            # 5. 상품명에 용량 단위가 있는지 확인
+            unit_match = re.search(
+                r"\d+(?:\.\d+)?\s*(ml|kg|g|l)\b",
+                product_name,
+                re.IGNORECASE
+            )
+
+            unit = (
+                unit_match.group(1)
+                if unit_match
+                else None
+            )
+
+            items.append({
+                "product_name": product_name,
+                "total_amount": quantity,
+                "unit": unit
+            })
+
+    return items
