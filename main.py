@@ -678,8 +678,7 @@ def register_products(
                     category,
                     subcategory,
                     quantity,
-                    total_amount,
-                    unit,
+                    unit
                 FROM receipt_items
                 WHERE receipt_id = %s
                   AND ocritem_id IN ({placeholders})
@@ -716,8 +715,12 @@ def register_products(
                 raw_category = ocr_item["category"]
 
                 if raw_category in ("food", "식료품"):
+
                     category = "food"
                     subcategory = "과자"
+
+                    total_amount = None
+                    unit = ocr_item["unit"]
 
                     if item.product_date is not None:
                         product_date = item.product_date
@@ -734,19 +737,32 @@ def register_products(
                     subcategory = "일회용 위생용품"
 
                     # OCR 결과 DB에 저장된 용량과 단위 사용
-                    total_amount = ocr_item["total_amount"]
+                    # 상품명에서 개당 용량 추출
+                    amount_match = re.search(
+                        r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)\b",
+                        product_name,
+                        re.IGNORECASE
+                    )
+
+                    quantity = ocr_item["quantity"]
                     unit = ocr_item["unit"]
 
-                    if total_amount is None or not unit:
+                    if quantity is None or quantity <= 0:
                         raise HTTPException(
                             status_code=400,
-                            detail=(
-                                f"{product_name}: "
-                                "OCR에서 용량 또는 단위를 인식하지 못했습니다."
-                            )
+                            detail=f"{product_name}: 구매 수량이 올바르지 않습니다."
                         )
 
-                    total_amount = float(total_amount)
+                    if amount_match is None or not unit:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"{product_name}: 용량 또는 단위를 확인할 수 없습니다."
+                        )
+
+                    amount_per_item = float(amount_match.group(1))
+
+                    # 개당 용량 × 구매 수량
+                    total_amount = amount_per_item * quantity
 
                     # 사용자별 K-Factor 조회
                     cursor.execute("""
@@ -818,8 +834,8 @@ def register_products(
                     subcategory,
                     today,
                     product_date,
-                    ocr_item["total_amount"],
-                    ocr_item["unit"],
+                    total_amount,
+                    unit,
                     "HEALTHY",
                     None,
                     k_factor,
@@ -917,7 +933,9 @@ def get_receipt_items(
                     product_name,
                     category,
                     subcategory,
-                    product_date
+                    product_date,
+                    quantity,
+                    unit
                 FROM receipt_items
                 WHERE receipt_id = %s
                 ORDER BY ocritem_id
@@ -2957,6 +2975,7 @@ async def upload_receipt(
 
             # OCR 상품 저장
             # OCR 상품 저장
+            # OCR 상품 저장
             for item in items:
                 cursor.execute("""
                     INSERT INTO receipt_items (
@@ -2966,10 +2985,9 @@ async def upload_receipt(
                         subcategory,
                         product_date,
                         quantity,
-                        total_amount,
                         unit
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (
                     receipt_id,
                     item["product_name"],
@@ -2977,7 +2995,6 @@ async def upload_receipt(
                     item["subcategory"],
                     None,
                     item.get("quantity"),
-                    item.get("total_amount"),
                     item.get("unit")
                 ))
 
@@ -3065,7 +3082,7 @@ def extract_receipt_items(ocr_result):
     items = []
 
     excluded_keywords = [
-        "상품명", "제품명", "단가", "수량", "금액",
+        "상품명", "제품명", "수량", "금액",
         "할인", "합계", "부가세", "과세",
         "결제", "총매출", "받은금액", "거스름돈"
     ]
@@ -3102,7 +3119,7 @@ def extract_receipt_items(ocr_result):
         # 2. 위에서 아래로 정렬
         rows.sort(key=lambda r: r["y"])
 
-        # 3. 같은 행의 OCR 결과 묶기
+        # 3. 같은 행 묶기
         grouped_rows = []
 
         for row in rows:
@@ -3114,21 +3131,18 @@ def extract_receipt_items(ocr_result):
             else:
                 grouped_rows.append([row])
 
-        # 4. 상품별 정보 추출
+        # 4. 상품 정보 추출
         for group in grouped_rows:
             group.sort(key=lambda r: r["x"])
 
-            texts = [r["text"] for r in group]
-            full_text = " ".join(texts)
+            full_text = " ".join(r["text"] for r in group)
 
-            # 불필요한 행 제외
             if any(
                 keyword in full_text
                 for keyword in excluded_keywords
             ):
                 continue
 
-            # 숫자로만 구성된 금액/수량 후보
             numeric_fields = []
 
             for index, row in enumerate(group):
@@ -3140,28 +3154,21 @@ def extract_receipt_items(ocr_result):
                         "value": number
                     })
 
-            # 단가, 수량, 총금액 3개가 필요
-            if len(numeric_fields) != 3:
+            # 수량, 가격 순서로 숫자 2개
+            if len(numeric_fields) != 2:
                 continue
 
-            unit_price = numeric_fields[0]["value"]
-            quantity = numeric_fields[1]["value"]
-            total_price = numeric_fields[2]["value"]
+            quantity = numeric_fields[0]["value"]
 
-            # 잘못 인식한 행 제외
-            if quantity <= 0 or unit_price <= 0:
+            if quantity <= 0:
                 continue
 
-            # 단가 × 수량 = 총금액 검증
-            if unit_price * quantity != total_price:
-                continue
-
-            # 5. 단가보다 왼쪽에 있는 텍스트를 상품명으로 사용
-            price_index = numeric_fields[0]["index"]
+            # 5. 수량 왼쪽의 텍스트를 상품명으로 사용
+            quantity_index = numeric_fields[0]["index"]
 
             name_parts = [
                 row["text"]
-                for row in group[:price_index]
+                for row in group[:quantity_index]
             ]
 
             product_name = " ".join(name_parts).strip()
@@ -3169,35 +3176,25 @@ def extract_receipt_items(ocr_result):
             if not re.search(r"[가-힣a-zA-Z]", product_name):
                 continue
 
-            # 6. 상품명에서 용량 추출
-            amount_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*"
-                r"(ml|kg|g|l|매|개|롤|팩|장|입)\b",
+            # 6. 상품명에서 단위 추출
+            unit_match = re.search(
+                r"\d+(?:\.\d+)?\s*(ml|kg|g|l|매|개|롤|팩|장|입)\b",
                 product_name,
                 re.IGNORECASE
             )
 
-            total_amount = None
-            unit = None
+            unit = unit_match.group(1) if unit_match else None
 
-            if amount_match:
-                amount_per_item = float(amount_match.group(1))
-                unit = amount_match.group(2)
-
-                total_amount = amount_per_item * quantity
-
-            # 7. 상품 정보 저장
+            # 7. 상품명, 수량, 단위만 반환
             items.append({
                 "product_name": product_name,
-                "unit_price": unit_price,
                 "quantity": quantity,
-                "total_price": total_price,
-                "total_amount": total_amount,
                 "unit": unit
             })
 
     return items
 
+    return items
 def extract_product_date(ocr_result):
     texts = []
 
