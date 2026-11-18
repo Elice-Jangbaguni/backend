@@ -213,6 +213,192 @@ def get_current_user_id(
         if conn is not None:
             conn.close()
 
+class DepleteProductRequest(BaseModel):
+    depleted_date: date
+
+
+@app.post("/api/products/{product_id}/deplete")
+def deplete_product(
+    product_id: int,
+    request: DepleteProductRequest,
+    user_id: int = Depends(get_current_user_id)
+):
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+
+            # 1. 로그인한 사용자의 상품 조회
+            cursor.execute(
+                """
+                SELECT *
+                FROM products
+                WHERE product_id = %s AND user_id = %s
+                FOR UPDATE
+                """,
+                (product_id, user_id)
+            )
+
+            product = cursor.fetchone()
+
+            if product is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="상품을 찾을 수 없습니다."
+                )
+
+            if product["depleted_date"] is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="이미 소진 처리된 상품입니다."
+                )
+
+            if product["purchased_date"] is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="구매일 정보가 없습니다."
+                )
+
+            actual_days = (
+                request.depleted_date - product["purchased_date"]
+            ).days
+
+            if actual_days <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="실제 소진일은 구매일보다 늦어야 합니다."
+                )
+
+            if request.depleted_date > date.today():
+                raise HTTPException(
+                    status_code=400,
+                    detail="미래 날짜는 입력할 수 없습니다."
+                )
+
+            updated_k_factor = None
+
+            # 2. AI 예측 생필품인 경우에만 K-Factor 갱신
+            if (
+                product["category"] in ("daily", "생필품")
+                and product["expiration_source"] == "ai_prediction"
+            ):
+
+                category = product["subcategory"]
+
+                if not category:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="생필품 소분류가 없습니다."
+                    )
+
+                if not product["predicted_days"]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="예측 일수 정보가 없습니다."
+                    )
+
+                # 3. 사용자별 K-Factor 조회 및 행 잠금
+                cursor.execute(
+                    """
+                    SELECT k_factor, sample_count
+                    FROM user_k_factors
+                    WHERE user_id = %s AND category = %s
+                    FOR UPDATE
+                    """,
+                    (user_id, category)
+                )
+
+                k_row = cursor.fetchone()
+
+                if k_row:
+                    current_k = float(k_row["k_factor"])
+                    sample_count = k_row["sample_count"]
+                else:
+                    current_k = 1.0
+                    sample_count = 0
+
+                # 등록 시 사용한 K-Factor로 기본 예측 일수 복원
+                product_k = float(product["k_factor"] or 1.0)
+
+                base_days = max(
+                    1,
+                    round(product["predicted_days"] / product_k)
+                )
+
+                # 4. 팀원의 AI 엔진으로 K-Factor 갱신
+                updated_k_factor = consumable_engine.update_k_factor(
+                    current_k=current_k,
+                    base_days=base_days,
+                    actual_days=actual_days,
+                    sample_count=sample_count
+                )
+
+                # 5. 사용자별 K-Factor 저장
+                cursor.execute(
+                    """
+                    INSERT INTO user_k_factors
+                        (user_id, category, k_factor, sample_count)
+                    VALUES (%s, %s, %s, 1)
+                    ON DUPLICATE KEY UPDATE
+                        k_factor = %s,
+                        sample_count = sample_count + 1
+                    """,
+                    (
+                        user_id,
+                        category,
+                        updated_k_factor,
+                        updated_k_factor
+                    )
+                )
+
+            # 6. 상품 소진 처리
+            cursor.execute(
+                """
+                UPDATE products
+                SET status = 'DEPLETED',
+                    depleted_date = %s
+                WHERE product_id = %s AND user_id = %s
+                """,
+                (
+                    request.depleted_date,
+                    product_id,
+                    user_id
+                )
+            )
+
+        conn.commit()
+
+        return {
+            "product_id": product_id,
+            "product_name": product["product_name"],
+            "status": "DEPLETED",
+            "depleted_date": request.depleted_date.isoformat(),
+            "updated_k_factor": updated_k_factor,
+            "message": "소진 처리가 완료되었습니다."
+        }
+
+    except HTTPException:
+        if conn is not None:
+            conn.rollback()
+        raise
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+
+        print("상품 소진 처리 오류:", repr(e), flush=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="상품 소진 처리 중 오류가 발생했습니다."
+        )
+
+    finally:
+        if conn is not None:
+            conn.close()
+
 def get_user_k_factor(user_id: int, category: str) -> float:
     conn = get_connection()
 
@@ -316,6 +502,8 @@ def home():
 
 
 def calculate_product_status(product):
+    if product.get("depleted_date") is not None:
+        return "DEPLETED", None
     category = product["category"]
     product_date = product["product_date"]
 
