@@ -30,12 +30,21 @@ from google import genai
 from google.genai import types
 from typing import Literal
 from zoneinfo import ZoneInfo
+from consumable_engine import ConsumablePersonalizationEngine
 
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
 )
 
 app = FastAPI(title="장바구니 API")
+
+# AI 모델 파일 경로
+MODEL_PATH = Path(__file__).resolve().parent / "consumable_predictor.pkl"
+
+# AI 엔진 초기화
+consumable_engine = ConsumablePersonalizationEngine(
+    model_path=str(MODEL_PATH)
+)
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -70,6 +79,54 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
+class PredictExpirationRequest(BaseModel):
+    category: str
+    subcategory: str
+    total_amount: float = Field(gt=0)
+    unit: str
+
+@app.post("/api/products/predict-expiration")
+def predict_expiration(
+    request: PredictExpirationRequest,
+    user_id: int = Depends(get_current_user_id)
+):
+    if request.category not in ("생필품", "식료품"):
+        raise HTTPException(
+            status_code=400,
+            detail="category는 생필품 또는 식료품이어야 합니다."
+        )
+
+    try:
+        result = consumable_engine.resolve_expiration(
+            category=request.category,
+            subcategory=request.subcategory,
+            total_amount=request.total_amount,
+            unit=request.unit,
+            db_default_days=14,
+            k_factor=1.0
+        )
+
+        predicted_days = result["predicted_days"]
+
+        # 생필품의 개인화 적용 전 기본 예측 일수
+        base_days = predicted_days if request.category == "생필품" else None
+
+        return {
+            "item_type": request.category,
+            "base_days": base_days,
+            "k_factor": 1.0 if request.category == "생필품" else None,
+            "predicted_days": predicted_days,
+            "product_date": result["product_date"],
+            "expiration_source": result["expiration_source"],
+            "allow_expiry_ocr": result["allow_expiry_ocr"]
+        }
+
+    except Exception as e:
+        print("소진일 예측 오류:", repr(e), flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail="소진일 예측 중 오류가 발생했습니다."
+        )
 
 # OCR 결과에서 등록할 상품 정보
 class ProductItem(BaseModel):
