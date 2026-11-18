@@ -2949,6 +2949,85 @@ async def upload_receipt(
                 detail="지원하지 않는 상품 분류 결과입니다."
             )
 
+    # 9. 모달에 표시할 임시 소비기한 / 예측 소진기한 계산
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+    for item in items:
+        product_name = item["product_name"]
+
+        # 식료품: 기본 소비기한 14일
+        if item["category"] == "food":
+            item["product_date"] = today + timedelta(days=14)
+            item["expiration_source"] = "db_default"
+            item["predicted_days"] = None
+            item["total_amount"] = None
+            item["k_factor"] = None
+
+        # 생필품: AI 소진기한 예측
+        elif item["category"] == "daily":
+
+            # 상품명에서 개당 용량 추출
+            amount_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
+                product_name,
+                re.IGNORECASE
+            )
+
+            quantity = item.get("quantity")
+            unit = item.get("unit")
+
+            # 용량을 알 수 없는 경우 기본 14일 사용
+            if amount_match is None or not unit or not quantity:
+                item["product_date"] = today + timedelta(days=14)
+                item["expiration_source"] = "db_default"
+                item["predicted_days"] = None
+                item["total_amount"] = None
+                item["k_factor"] = None
+                continue
+
+            total_amount = float(amount_match.group(1)) * quantity
+            subcategory = item["subcategory"]
+
+            # 사용자별 K-Factor
+            k_factor = get_user_k_factor(
+                user_id=user_id,
+                category=subcategory
+            )
+
+            try:
+                prediction = consumable_engine.resolve_expiration(
+                    category="생필품",
+                    subcategory=subcategory,
+                    total_amount=total_amount,
+                    unit=unit,
+                    db_default_days=14,
+                    k_factor=k_factor
+                )
+
+                predicted_days = int(prediction["predicted_days"])
+
+                item["product_date"] = today + timedelta(
+                    days=predicted_days
+                )
+                item["expiration_source"] = prediction.get(
+                    "expiration_source", "ai_prediction"
+                )
+                item["predicted_days"] = predicted_days
+                item["total_amount"] = total_amount
+                item["k_factor"] = k_factor
+
+            except Exception as e:
+                print(
+                    f"생필품 소진일 예측 실패 ({product_name}):",
+                    repr(e),
+                    flush=True
+                )
+
+                item["product_date"] = today + timedelta(days=14)
+                item["expiration_source"] = "db_default"
+                item["predicted_days"] = None
+                item["total_amount"] = total_amount
+                item["k_factor"] = k_factor
     # 9. OCR 결과 DB 저장
     conn = None
 
@@ -2993,7 +3072,7 @@ async def upload_receipt(
                     item["product_name"],
                     item["category"],
                     item["subcategory"],
-                    None,
+                    item["product_date"],
                     item.get("quantity"),
                     item.get("unit")
                 ))
@@ -3178,7 +3257,7 @@ def extract_receipt_items(ocr_result):
 
             # 6. 상품명에서 단위 추출
             unit_match = re.search(
-                r"\d+(?:\.\d+)?\s*(ml|kg|g|l|매|개|롤|팩|장|입)\b",
+                r"\d+(?:\.\d+)?\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
                 product_name,
                 re.IGNORECASE
             )
