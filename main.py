@@ -29,6 +29,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from google import genai
 from google.genai import types
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
@@ -210,6 +211,44 @@ def home():
     return {"message": "장바구니 백엔드 서버 실행 성공"}
 
 
+def calculate_product_status(product):
+    category = product["category"]
+    product_date = product["product_date"]
+
+    if product_date is None:
+        return "UNKNOWN", None
+
+    if isinstance(product_date, datetime):
+        product_date = product_date.date()
+
+    elif isinstance(product_date, str):
+        product_date = date.fromisoformat(product_date)
+
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+    dday = (product_date - today).days
+
+    if category in ("food", "식료품"):
+        if dday < 0:
+            status = "EXPIRED"
+        elif dday <= 3:
+            status = "WARNING"
+        else:
+            status = "HEALTHY"
+
+    elif category in ("daily", "생필품"):
+        if dday < 0:
+            status = "DEPLETED"
+        elif dday <= 3:
+            status = "WARNING"
+        else:
+            status = "HEALTHY"
+
+    else:
+        status = "UNKNOWN"
+
+    return status, dday
+
 @app.get("/api/products")
 def get_products(
     user_id: int = Depends(get_current_user_id)
@@ -229,16 +268,57 @@ def get_products(
 
             products = cursor.fetchall()
 
+        summary = {
+            "expired_count": 0,
+            "warning_count": 0,
+            "recommended_items": []
+        }
+
         for product in products:
-            if isinstance(product["total_amount"], Decimal):
-                product["total_amount"] = float(
-                    product["total_amount"]
-                )
+
+            # Decimal -> float
+            for key in ("total_amount", "k_factor"):
+                if isinstance(product.get(key), Decimal):
+                    product[key] = float(product[key])
+
+            # 상품 상태 및 D-Day 계산
+            status, dday = calculate_product_status(product)
+
+            product["status"] = status
+            product["dday"] = dday
+
+            # 프론트엔드 카테고리 통일
+            if product["category"] == "food":
+                product["category"] = "식료품"
+
+            elif product["category"] == "daily":
+                product["category"] = "생필품"
+
+            category = product["category"]
+
+            # 소비기한 지난 식료품
+            if category == "식료품" and status == "EXPIRED":
+                summary["expired_count"] += 1
+
+            if category == "식료품" and status == "WARNING":
+                summary["warning_count"] += 1
+
+            # 생필품 공동구매 추천 후보
+            if category == "생필품" and status in (
+                "DEPLETED",
+                "WARNING"
+            ):
+                summary["recommended_items"].append({
+                    "product_id": product["product_id"],
+                    "product_name": product["product_name"],
+                    "subcategory": product["subcategory"]
+                })
 
         return {
             "total": len(products),
             "page": 1,
             "limit": 20,
+            "summary": summary,
             "products": products
         }
 
@@ -253,7 +333,6 @@ def get_products(
     finally:
         if conn is not None:
             conn.close()
-
 
 @app.post("/products", status_code=201)
 def register_products(request: ProductRegisterRequest, user_id: int = Depends(get_current_user_id)):
