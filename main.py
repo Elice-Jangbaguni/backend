@@ -213,6 +213,30 @@ def get_current_user_id(
         if conn is not None:
             conn.close()
 
+def get_user_k_factor(user_id: int, category: str) -> float:
+    conn = get_connection()
+
+    try:
+        with conn.cursor(DictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT k_factor
+                FROM user_k_factors
+                WHERE user_id = %s AND category = %s
+                """,
+                (user_id, category)
+            )
+
+            row = cursor.fetchone()
+
+        if row is None:
+            return 1.0
+
+        return float(row["k_factor"])
+
+    finally:
+        conn.close()
+
 class PredictExpirationRequest(BaseModel):
     category: str
     subcategory: str
@@ -231,24 +255,47 @@ def predict_expiration(
         )
 
     try:
+        # 1. 사용자별 K-Factor 조회
+        k_factor = 1.0
+
+        if request.category == "생필품":
+            k_factor = get_user_k_factor(
+                user_id=user_id,
+                category=request.subcategory
+            )
+
+        # 2. AI 예측 엔진 호출
         result = consumable_engine.resolve_expiration(
             category=request.category,
             subcategory=request.subcategory,
             total_amount=request.total_amount,
             unit=request.unit,
             db_default_days=14,
-            k_factor=1.0
+            k_factor=k_factor
         )
 
+        # 3. 예측 결과 반환
         predicted_days = result["predicted_days"]
 
-        # 생필품의 개인화 적용 전 기본 예측 일수
-        base_days = predicted_days if request.category == "생필품" else None
+        base_days = None
+
+        if request.category == "생필품":
+            # 엔진은 base_days를 직접 반환하지 않으므로
+            # 동일 조건에서 k_factor=1.0으로 계산
+            base_result = consumable_engine.predict_consumable_days(
+                subcategory=request.subcategory,
+                total_amount=request.total_amount,
+                unit=request.unit,
+                k_factor=1.0
+            )
+            base_days = base_result["predicted_days"]
 
         return {
             "item_type": request.category,
             "base_days": base_days,
-            "k_factor": 1.0 if request.category == "생필품" else None,
+            "k_factor": (
+                k_factor if request.category == "생필품" else None
+            ),
             "predicted_days": predicted_days,
             "product_date": result["product_date"],
             "expiration_source": result["expiration_source"],
