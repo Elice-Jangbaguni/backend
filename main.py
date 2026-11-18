@@ -79,13 +79,16 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# OCR 결과에서 등록할 상품 정보
 class ProductItem(BaseModel):
     ocritem_id: int
     product_name: str = Field(min_length=1)
     category: str
     subcategory: Optional[str] = None
     product_date: Optional[date] = None
+
+    # 생필품 AI 예측에 필요한 정보
+    total_amount: Optional[float] = Field(default=None, gt=0)
+    unit: Optional[str] = None
 
 
 # 상품 등록 요청
@@ -627,19 +630,24 @@ def get_products(
             conn.close()
 
 @app.post("/products", status_code=201)
-def register_products(request: ProductRegisterRequest, user_id: int = Depends(get_current_user_id)):
+def register_products(
+    request: ProductRegisterRequest,
+    user_id: int = Depends(get_current_user_id)
+):
     conn = None
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
     try:
         conn = get_connection()
 
         with conn.cursor(DictCursor) as cursor:
 
-            # 1. 영수증 소유자 확인
+            # 1. 영수증 소유자 확인 및 잠금
             cursor.execute("""
                 SELECT receipt_id
                 FROM receipts
                 WHERE receipt_id = %s AND user_id = %s
+                FOR UPDATE
             """, (request.receipt_id, user_id))
 
             if cursor.fetchone() is None:
@@ -648,7 +656,7 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
                     detail="해당 영수증을 찾을 수 없습니다."
                 )
 
-            # 2. 요청 내부의 중복 OCR 상품 확인
+            # 2. 중복 OCR 상품 확인
             item_ids = [
                 item.ocritem_id for item in request.products
             ]
@@ -659,11 +667,16 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
                     detail="중복된 OCR 상품이 포함되어 있습니다."
                 )
 
-            # 3. OCR 상품 확인 및 잠금
+            # 3. DB에 저장된 OCR 상품 조회
             placeholders = ",".join(["%s"] * len(item_ids))
 
             cursor.execute(f"""
-                SELECT ocritem_id, product_id
+                SELECT
+                    ocritem_id,
+                    product_id,
+                    product_name,
+                    category,
+                    subcategory
                 FROM receipt_items
                 WHERE receipt_id = %s
                   AND ocritem_id IN ({placeholders})
@@ -681,17 +694,93 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
                     detail="OCR 상품 정보를 찾을 수 없습니다."
                 )
 
+            registered_products = []
+
+            # 4. 상품별 등록
             for item in request.products:
-                if ocr_items[item.ocritem_id]["product_id"] is not None:
+
+                ocr_item = ocr_items[item.ocritem_id]
+
+                if ocr_item["product_id"] is not None:
                     raise HTTPException(
                         status_code=409,
                         detail="이미 등록된 OCR 상품이 있습니다."
                     )
 
-            registered_products = []
+                # 사용자가 모달에서 상품명/분류를 수정하지 않으므로
+                # 서버에 저장된 OCR 결과를 기준으로 사용
+                product_name = ocr_item["product_name"]
+                raw_category = ocr_item["category"]
 
-            # 4. 상품 등록
-            for item in request.products:
+                if raw_category in ("food", "식료품"):
+                    category = "food"
+                    subcategory = "과자"
+
+                    if item.product_date is not None:
+                        product_date = item.product_date
+                        expiration_source = "ocr"
+                    else:
+                        product_date = today + timedelta(days=14)
+                        expiration_source = "db_default"
+
+                    predicted_days = None
+                    k_factor = 1.0
+
+                elif raw_category in ("daily", "생필품"):
+                    category = "daily"
+                    subcategory = "일회용 위생용품"
+
+                    if item.total_amount is None or not item.unit:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"{product_name}: "
+                                "AI 예측에 필요한 수량과 단위가 없습니다."
+                            )
+                        )
+
+                    # 사용자별 K-Factor 조회
+                    cursor.execute("""
+                        SELECT k_factor
+                        FROM user_k_factors
+                        WHERE user_id = %s
+                          AND category = %s
+                    """, (user_id, subcategory))
+
+                    k_row = cursor.fetchone()
+
+                    k_factor = (
+                        float(k_row["k_factor"])
+                        if k_row else 1.0
+                    )
+
+                    # 기존 팀원 AI 엔진 호출
+                    prediction = consumable_engine.resolve_expiration(
+                        category="생필품",
+                        subcategory=subcategory,
+                        total_amount=item.total_amount,
+                        unit=item.unit,
+                        db_default_days=14,
+                        k_factor=k_factor
+                    )
+
+                    predicted_days = int(
+                        prediction["predicted_days"]
+                    )
+
+                    product_date = today + timedelta(
+                        days=predicted_days
+                    )
+
+                    expiration_source = "ai_prediction"
+
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="지원하지 않는 상품 카테고리입니다."
+                    )
+
+                # 5. products에 실제 상품 저장
                 cursor.execute("""
                     INSERT INTO products (
                         user_id,
@@ -699,30 +788,49 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
                         product_name,
                         category,
                         subcategory,
+                        purchased_date,
                         product_date,
-                        status
+                        total_amount,
+                        unit,
+                        status,
+                        depleted_date,
+                        k_factor,
+                        expiration_source,
+                        predicted_days
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
                 """, (
                     user_id,
                     request.receipt_id,
-                    item.product_name,
-                    item.category,
-                    item.subcategory,
-                    item.product_date,
-                    "HEALTHY"
+                    product_name,
+                    category,
+                    subcategory,
+                    today,
+                    product_date,
+                    item.total_amount,
+                    item.unit,
+                    "HEALTHY",
+                    None,
+                    k_factor,
+                    expiration_source,
+                    predicted_days
                 ))
 
                 product_id = cursor.lastrowid
 
-                # 5. OCR 상품과 실제 상품 연결
+                # 6. OCR 상품과 실제 상품 연결
                 cursor.execute("""
                     UPDATE receipt_items
-                    SET product_id = %s
+                    SET product_id = %s,
+                        product_date = %s
                     WHERE ocritem_id = %s
                       AND receipt_id = %s
                 """, (
                     product_id,
+                    product_date,
                     item.ocritem_id,
                     request.receipt_id
                 ))
@@ -730,10 +838,16 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
                 registered_products.append({
                     "ocritem_id": item.ocritem_id,
                     "product_id": product_id,
-                    "product_name": item.product_name
+                    "product_name": product_name,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "product_date": product_date.isoformat(),
+                    "expiration_source": expiration_source,
+                    "predicted_days": predicted_days,
+                    "k_factor": k_factor
                 })
 
-        # 6. 모든 상품 등록이 성공하면 저장
+        # 모든 상품이 성공적으로 등록되면 저장
         conn.commit()
 
         return {
@@ -747,9 +861,12 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
             conn.rollback()
         raise
 
-    except Exception:
+    except Exception as e:
         if conn is not None:
             conn.rollback()
+
+        print("상품 등록 오류:", repr(e), flush=True)
+
         raise HTTPException(
             status_code=500,
             detail="상품 등록 중 오류가 발생했습니다."
@@ -758,19 +875,19 @@ def register_products(request: ProductRegisterRequest, user_id: int = Depends(ge
     finally:
         if conn is not None:
             conn.close()
-
-
 @app.get("/api/receipts/{receipt_id}/items")
-def get_receipt_items(receipt_id: int):
+def get_receipt_items(
+    receipt_id: int,
+    user_id: int = Depends(get_current_user_id)
+):
     conn = None
 
     try:
         conn = get_connection()
 
         with conn.cursor(DictCursor) as cursor:
-            user_id = get_test_user_id(cursor)
 
-            # 해당 사용자의 영수증인지 확인
+            # 1. 로그인한 사용자의 영수증인지 확인
             cursor.execute("""
                 SELECT receipt_id
                 FROM receipts
@@ -784,7 +901,7 @@ def get_receipt_items(receipt_id: int):
                     detail="해당 영수증을 찾을 수 없습니다."
                 )
 
-            # OCR 인식 상품 조회
+            # 2. OCR 인식 상품 조회
             cursor.execute("""
                 SELECT
                     ocritem_id,
@@ -802,13 +919,16 @@ def get_receipt_items(receipt_id: int):
 
         return {
             "receipt_id": receipt_id,
+            "total": len(items),
             "items": items
         }
 
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as e:
+        print("OCR 상품 조회 오류:", repr(e), flush=True)
+
         raise HTTPException(
             status_code=500,
             detail="OCR 상품 조회 중 오류가 발생했습니다."
@@ -817,7 +937,6 @@ def get_receipt_items(receipt_id: int):
     finally:
         if conn is not None:
             conn.close()
-
 
 @app.delete("/api/products/{product_id}", status_code=204)
 def delete_product(product_id: int,
@@ -876,96 +995,6 @@ def delete_product(product_id: int,
         raise HTTPException(
             status_code=500,
             detail="상품 삭제 중 오류가 발생했습니다."
-        )
-
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-
-@app.patch("/api/products/{product_id}/deplete")
-def deplete_product(product_id: int, user_id: int = Depends(get_current_user_id)):
-    conn = None
-
-    try:
-        conn = get_connection()
-
-        with conn.cursor(DictCursor) as cursor:
-
-            # 1. 상품 확인
-            cursor.execute("""
-                SELECT
-                    product_id,
-                    product_name,
-                    category,
-                    status,
-                    depleted_date
-                FROM products
-                WHERE product_id = %s
-                  AND user_id = %s
-                FOR UPDATE
-            """, (product_id, user_id))
-
-            product = cursor.fetchone()
-
-            if product is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="상품을 찾을 수 없습니다."
-                )
-
-            # 2. 생필품인지 확인
-            if product["category"] != "daily":
-                raise HTTPException(
-                    status_code=400,
-                    detail="생필품만 소진 처리할 수 있습니다."
-                )
-
-            # 3. 이미 소진된 상품인지 확인
-            if product["status"] == "DEPLETED":
-                raise HTTPException(
-                    status_code=409,
-                    detail="이미 소진 처리된 상품입니다."
-                )
-
-            # 4. 소진 상태 및 날짜 변경
-            today = date.today()
-
-            cursor.execute("""
-                UPDATE products
-                SET status = %s,
-                    depleted_date = %s
-                WHERE product_id = %s
-                  AND user_id = %s
-            """, (
-                "DEPLETED",
-                today,
-                product_id,
-                user_id
-            ))
-
-        conn.commit()
-
-        return {
-            "product_id": product_id,
-            "product_name": product["product_name"],
-            "status": "DEPLETED",
-            "depleted_date": today.isoformat()
-        }
-
-    except HTTPException:
-        if conn is not None:
-            conn.rollback()
-        raise
-
-    except Exception:
-        if conn is not None:
-            conn.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail="상품 소진 처리 중 오류가 발생했습니다."
         )
 
     finally:
@@ -2870,13 +2899,96 @@ async def upload_receipt(
     }
 
     for i, item in enumerate(items, start=1):
-        classification = classification_map[i]
+        classification = classification_map.get(i)
 
-        item["category"] = classification["category"]
-        item["subcategory"] = classification["subcategory"]
+        if classification is None:
+            raise HTTPException(
+                status_code=502,
+                detail="일부 상품의 분류 결과가 누락되었습니다."
+            )
 
-    # 9. 결과 반환
+        category = classification["category"]
+
+        if category in ("food", "식료품"):
+            item["category"] = "food"
+            item["subcategory"] = "과자"
+
+        elif category in ("daily", "생필품"):
+            item["category"] = "daily"
+            item["subcategory"] = "일회용 위생용품"
+
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="지원하지 않는 상품 분류 결과입니다."
+            )
+
+    # 9. OCR 결과 DB 저장
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+
+            # 영수증 기록 생성
+            cursor.execute("""
+                INSERT INTO receipts (
+                    user_id,
+                    image_path,
+                    ocr_status
+                )
+                VALUES (%s, %s, %s)
+            """, (
+                user_id,
+                None,
+                "COMPLETED"
+            ))
+
+            receipt_id = cursor.lastrowid
+
+            # OCR 상품 저장
+            for item in items:
+                cursor.execute("""
+                    INSERT INTO receipt_items (
+                        receipt_id,
+                        product_name,
+                        category,
+                        subcategory,
+                        product_date
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    receipt_id,
+                    item["product_name"],
+                    item["category"],
+                    item["subcategory"],
+                    None
+                ))
+
+                item["ocritem_id"] = cursor.lastrowid
+
+        # 모든 저장 작업이 성공하면 확정
+        conn.commit()
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+
+        print("OCR 결과 DB 저장 오류:", repr(e), flush=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="OCR 결과 저장 중 오류가 발생했습니다."
+        )
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # 10. 결과 반환
     return {
+        "receipt_id": receipt_id,
         "user_id": user_id,
         "total": len(items),
         "items": items,
