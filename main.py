@@ -678,6 +678,11 @@ def register_products(
                     category,
                     subcategory,
                     quantity,
+                    product_date,
+                    total_amount,
+                    expiration_source,
+                    predicted_days,
+                    k_factor,
                     unit
                 FROM receipt_items
                 WHERE receipt_id = %s
@@ -711,98 +716,63 @@ def register_products(
 
                 # 사용자가 모달에서 상품명/분류를 수정하지 않으므로
                 # 서버에 저장된 OCR 결과를 기준으로 사용
+                # DB에 저장된 OCR 결과 사용
+
+                # 4. DB에 저장된 OCR 결과 사용
                 product_name = ocr_item["product_name"]
                 raw_category = ocr_item["category"]
 
-                if raw_category in ("food", "식료품"):
+                total_amount = ocr_item["total_amount"]
+                unit = ocr_item["unit"]
+                expiration_source = ocr_item["expiration_source"]
+                predicted_days = ocr_item["predicted_days"]
+                k_factor = ocr_item["k_factor"]
 
+                # 식료품
+                if raw_category in ("food", "식료품"):
                     category = "food"
                     subcategory = "과자"
 
-                    total_amount = None
-                    unit = ocr_item["unit"]
-
+                    # 소비기한 OCR로 수정한 날짜가 있다면 적용
                     if item.product_date is not None:
                         product_date = item.product_date
                         expiration_source = "ocr"
                     else:
-                        product_date = today + timedelta(days=14)
-                        expiration_source = "db_default"
+                        product_date = ocr_item["product_date"]
 
                     predicted_days = None
                     k_factor = 1.0
 
+                # 생필품
                 elif raw_category in ("daily", "생필품"):
                     category = "daily"
                     subcategory = "일회용 위생용품"
 
-                    # OCR 결과 DB에 저장된 용량과 단위 사용
-                    # 상품명에서 개당 용량 추출
-                    amount_match = re.search(
-                        r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)\b",
-                        product_name,
-                        re.IGNORECASE
-                    )
-
-                    quantity = ocr_item["quantity"]
-                    unit = ocr_item["unit"]
-
-                    if quantity is None or quantity <= 0:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"{product_name}: 구매 수량이 올바르지 않습니다."
-                        )
-
-                    if amount_match is None or not unit:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"{product_name}: 용량 또는 단위를 확인할 수 없습니다."
-                        )
-
-                    amount_per_item = float(amount_match.group(1))
-
-                    # 개당 용량 × 구매 수량
-                    total_amount = amount_per_item * quantity
-
-                    # 사용자별 K-Factor 조회
-                    cursor.execute("""
-                        SELECT k_factor
-                        FROM user_k_factors
-                        WHERE user_id = %s
-                          AND category = %s
-                    """, (user_id, subcategory))
-
-                    k_row = cursor.fetchone()
+                    # 업로드 단계에서 계산한 AI 예측 결과 재사용
+                    product_date = ocr_item["product_date"]
 
                     k_factor = (
-                        float(k_row["k_factor"])
-                        if k_row else 1.0
+                        float(k_factor)
+                        if k_factor is not None
+                        else 1.0
                     )
-
-                    # 기존 팀원 AI 엔진 호출
-                    prediction = consumable_engine.resolve_expiration(
-                        category="생필품",
-                        subcategory=subcategory,
-                        total_amount=total_amount,
-                        unit=unit,
-                        db_default_days=14,
-                        k_factor=k_factor
-                    )
-                    predicted_days = int(
-                        prediction["predicted_days"]
-                    )
-
-                    product_date = today + timedelta(
-                        days=predicted_days
-                    )
-
-                    expiration_source = "ai_prediction"
 
                 else:
                     raise HTTPException(
                         status_code=400,
                         detail="지원하지 않는 상품 카테고리입니다."
                     )
+
+                # 날짜 정보 확인
+                if product_date is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{product_name}: 소비기한 정보가 없습니다."
+                    )
+
+                # DB에서 날짜가 문자열로 반환된 경우 변환
+                if isinstance(product_date, str):
+                    product_date = date.fromisoformat(product_date)
 
                 # 5. products에 실제 상품 저장
                 cursor.execute("""
@@ -935,6 +905,10 @@ def get_receipt_items(
                     subcategory,
                     product_date,
                     quantity,
+                    total_amount,
+                    expiration_source,
+                    predicted_days,
+                    k_factor,
                     unit
                 FROM receipt_items
                 WHERE receipt_id = %s
@@ -2836,7 +2810,11 @@ def classify_products(products):
         {
             "id": p.id,
             "category": "food" if p.category == "식료품" else "daily",
-            "subcategory": "유제품" if p.category == "식료품" else "위생용품"
+            "subcategory": (
+                "과자"
+                if p.category == "식료품"
+                else "일회용 위생용품"
+            )
         }
         for p in result.products
     ]
@@ -2949,46 +2927,33 @@ async def upload_receipt(
                 detail="지원하지 않는 상품 분류 결과입니다."
             )
 
-    # 9. 모달에 표시할 임시 소비기한 / 예측 소진기한 계산
+    # 9. 모달에 표시할 소비기한 / 예측 소진기한 계산
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
     for item in items:
-        product_name = item["product_name"]
 
         # 식료품: 기본 소비기한 14일
         if item["category"] == "food":
             item["product_date"] = today + timedelta(days=14)
             item["expiration_source"] = "db_default"
             item["predicted_days"] = None
-            item["total_amount"] = None
             item["k_factor"] = None
 
         # 생필품: AI 소진기한 예측
         elif item["category"] == "daily":
 
-            # 상품명에서 개당 용량 추출
-            amount_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
-                product_name,
-                re.IGNORECASE
-            )
-
-            quantity = item.get("quantity")
+            total_amount = item.get("total_amount")
             unit = item.get("unit")
+            subcategory = item["subcategory"]
 
-            # 용량을 알 수 없는 경우 기본 14일 사용
-            if amount_match is None or not unit or not quantity:
+            # 용량이 없는 경우 기본 14일
+            if total_amount is None or not unit:
                 item["product_date"] = today + timedelta(days=14)
                 item["expiration_source"] = "db_default"
                 item["predicted_days"] = None
-                item["total_amount"] = None
                 item["k_factor"] = None
                 continue
 
-            total_amount = float(amount_match.group(1)) * quantity
-            subcategory = item["subcategory"]
-
-            # 사용자별 K-Factor
             k_factor = get_user_k_factor(
                 user_id=user_id,
                 category=subcategory
@@ -3013,99 +2978,100 @@ async def upload_receipt(
                     "expiration_source", "ai_prediction"
                 )
                 item["predicted_days"] = predicted_days
-                item["total_amount"] = total_amount
                 item["k_factor"] = k_factor
 
             except Exception as e:
-                print(
-                    f"생필품 소진일 예측 실패 ({product_name}):",
-                    repr(e),
-                    flush=True
-                )
+                print("생필품 소진일 예측 실패:", repr(e), flush=True)
 
                 item["product_date"] = today + timedelta(days=14)
                 item["expiration_source"] = "db_default"
                 item["predicted_days"] = None
-                item["total_amount"] = total_amount
                 item["k_factor"] = k_factor
-    # 9. OCR 결과 DB 저장
-    conn = None
+        # 9. OCR 결과 DB 저장
+        conn = None
 
-    try:
-        conn = get_connection()
+        try:
+            conn = get_connection()
 
-        with conn.cursor(DictCursor) as cursor:
+            with conn.cursor(DictCursor) as cursor:
 
-            # 영수증 기록 생성
-            cursor.execute("""
-                INSERT INTO receipts (
-                    user_id,
-                    image_path,
-                    ocr_status
-                )
-                VALUES (%s, %s, %s)
-            """, (
-                user_id,
-                None,
-                "COMPLETED"
-            ))
-
-            receipt_id = cursor.lastrowid
-
-            # OCR 상품 저장
-            # OCR 상품 저장
-            # OCR 상품 저장
-            for item in items:
+                # 영수증 기록 생성
                 cursor.execute("""
-                    INSERT INTO receipt_items (
-                        receipt_id,
-                        product_name,
-                        category,
-                        subcategory,
-                        product_date,
-                        quantity,
-                        unit
+                    INSERT INTO receipts (
+                        user_id,
+                        image_path,
+                        ocr_status
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s)
                 """, (
-                    receipt_id,
-                    item["product_name"],
-                    item["category"],
-                    item["subcategory"],
-                    item["product_date"],
-                    item.get("quantity"),
-                    item.get("unit")
+                    user_id,
+                    None,
+                    "COMPLETED"
                 ))
 
-                item["ocritem_id"] = cursor.lastrowid
+                receipt_id = cursor.lastrowid
 
-        # 모든 저장 작업이 성공하면 확정
-        conn.commit()
+                # OCR 상품 저장
+                # OCR 상품 저장
+                # OCR 상품 저장
+                for item in items:
+                    cursor.execute("""
+                        INSERT INTO receipt_items (
+                            receipt_id,
+                            product_name,
+                            category,
+                            subcategory,
+                            product_date,
+                            quantity,
+                            total_amount,
+                            unit,
+                            expiration_source,
+                            predicted_days,
+                            k_factor
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        receipt_id,
+                        item["product_name"],
+                        item["category"],
+                        item["subcategory"],
+                        item["product_date"],
+                        item["quantity"],
+                        item["total_amount"],
+                        item["unit"],
+                        item["expiration_source"],
+                        item["predicted_days"],
+                        item["k_factor"]
+                    ))
+                    item["ocritem_id"] = cursor.lastrowid
 
-    except Exception as e:
-        if conn is not None:
-            conn.rollback()
+            # 모든 저장 작업이 성공하면 확정
+            conn.commit()
 
-        print("OCR 결과 DB 저장 오류:", repr(e), flush=True)
+        except Exception as e:
+            if conn is not None:
+                conn.rollback()
 
-        raise HTTPException(
-            status_code=500,
-            detail="OCR 결과 저장 중 오류가 발생했습니다."
-        )
+            print("OCR 결과 DB 저장 오류:", repr(e), flush=True)
 
-    finally:
-        if conn is not None:
-            conn.close()
+            raise HTTPException(
+                status_code=500,
+                detail="OCR 결과 저장 중 오류가 발생했습니다."
+            )
 
-    # 10. 결과 반환
-    return {
-        "receipt_id": receipt_id,
-        "user_id": user_id,
-        "total": len(items),
-        "items": items,
-        "texts": texts,
-        "ocr_result": ocr_result
-    }
+        finally:
+            if conn is not None:
+                conn.close()
+
+        # 10. 결과 반환
+        return {
+            "receipt_id": receipt_id,
+            "user_id": user_id,
+            "total": len(items),
+            "items": items,
+            "texts": texts,
+            "ocr_result": ocr_result
+        }
 
 @app.post("/api/products/product_date_ocr")
 async def product_date_ocr(
@@ -3255,25 +3221,33 @@ def extract_receipt_items(ocr_result):
             if not re.search(r"[가-힣a-zA-Z]", product_name):
                 continue
 
-            # 6. 상품명에서 단위 추출
-            unit_match = re.search(
-                r"\d+(?:\.\d+)?\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
+            # 6. 상품명에서 개당 용량과 단위 추출
+            amount_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
                 product_name,
                 re.IGNORECASE
             )
 
-            unit = unit_match.group(1) if unit_match else None
+            if amount_match:
+                amount_per_item = float(amount_match.group(1))
+                unit = amount_match.group(2).lower()
 
-            # 7. 상품명, 수량, 단위만 반환
+                # 개당 용량 × 구매 수량
+                total_amount = amount_per_item * quantity
+            else:
+                unit = None
+                total_amount = None
+
+            # 7. OCR 상품 결과 반환
             items.append({
                 "product_name": product_name,
                 "quantity": quantity,
-                "unit": unit
+                "unit": unit,
+                "total_amount": total_amount
             })
 
-    return items
+            return items
 
-    return items
 def extract_product_date(ocr_result):
     texts = []
 
