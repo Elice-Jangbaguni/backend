@@ -3123,75 +3123,100 @@ async def product_date_ocr(
         "product_date": product_date
     }
 
+
 def extract_receipt_items(ocr_result):
     items = []
 
     excluded_keywords = [
-        "상품명", "제품명", "수량", "금액",
-        "할인", "합계", "부가세", "과세",
-        "결제", "총매출", "받은금액", "거스름돈"
+        "상품명", "제품명", "상품 할인", "상품할인",
+        "총구매액", "총 구매액", "합계", "부가세",
+        "과세", "결제", "총매출", "총 매출",
+        "받은금액", "거스름돈", "신용카드",
+        "모바일상품권", "모바일 상품권",
+        "현금", "교환", "환불", "영수증",
+        "면세", "과세매출", "과세 매출"
     ]
 
     def parse_number(text):
         text = text.replace(",", "").replace("원", "").strip()
-
         if re.fullmatch(r"\d+", text):
             return int(text)
-
         return None
 
     for image in ocr_result.get("images", []):
         fields = image.get("fields", [])
-        rows = []
+        detected = []
 
-        # 1. OCR 텍스트와 좌표 추출
+        # 1. OCR 글자 및 좌표 추출
         for field in fields:
             text = field.get("inferText", "").strip()
-            vertices = field.get("boundingPoly", {}).get("vertices", [])
+            vertices = field.get(
+                "boundingPoly", {}
+            ).get("vertices", [])
 
-            if not text or not vertices:
+            if not text or len(vertices) < 4:
                 continue
 
             x = sum(v["x"] for v in vertices) / len(vertices)
             y = sum(v["y"] for v in vertices) / len(vertices)
 
-            rows.append({
+            height = (
+                max(v["y"] for v in vertices)
+                - min(v["y"] for v in vertices)
+            )
+
+            detected.append({
                 "text": text,
                 "x": x,
-                "y": y
+                "y": y,
+                "height": height
             })
 
-        # 2. 위에서 아래로 정렬
-        rows.sort(key=lambda r: r["y"])
+        detected.sort(key=lambda r: r["y"])
 
-        # 3. 같은 행 묶기
+        # 2. 글자 높이에 따라 같은 행 묶기
         grouped_rows = []
 
-        for row in rows:
-            if (
-                grouped_rows
-                and abs(grouped_rows[-1][0]["y"] - row["y"]) < 12
-            ):
-                grouped_rows[-1].append(row)
-            else:
-                grouped_rows.append([row])
+        for field in detected:
+            if not grouped_rows:
+                grouped_rows.append([field])
+                continue
 
-        # 4. 상품 정보 추출
+            last_group = grouped_rows[-1]
+            avg_y = sum(r["y"] for r in last_group) / len(last_group)
+            avg_height = sum(
+                r["height"] for r in last_group
+            ) / len(last_group)
+
+            tolerance = max(
+                6,
+                min(avg_height, field["height"]) * 0.55
+            )
+
+            if abs(avg_y - field["y"]) <= tolerance:
+                last_group.append(field)
+            else:
+                grouped_rows.append([field])
+
+        # 3. 상품 정보 추출
         for group in grouped_rows:
             group.sort(key=lambda r: r["x"])
 
             full_text = " ".join(r["text"] for r in group)
+            normalized_text = re.sub(r"\s+", "", full_text)
 
+            # 상품이 아닌 행 제외
             if any(
-                keyword in full_text
+                keyword.replace(" ", "") in normalized_text
                 for keyword in excluded_keywords
             ):
                 continue
 
+            # 숫자 필드 추출
             numeric_fields = []
 
-            for index, row in enumerate(group):
-                number = parse_number(row["text"])
+            for index, field in enumerate(group):
+                number = parse_number(field["text"])
 
                 if number is not None:
                     numeric_fields.append({
@@ -3199,21 +3224,23 @@ def extract_receipt_items(ocr_result):
                         "value": number
                     })
 
-            # 수량, 가격 순서로 숫자 2개
-            if len(numeric_fields) != 2:
+            # 상품명 / 수량 / 금액 구조
+            if len(numeric_fields) < 2:
                 continue
 
-            quantity = numeric_fields[0]["value"]
+            # 오른쪽 숫자 2개를 수량과 금액으로 해석
+            quantity_field = numeric_fields[-2]
+            price_field = numeric_fields[-1]
+
+            quantity = quantity_field["value"]
 
             if quantity <= 0:
                 continue
 
-            # 5. 수량 왼쪽의 텍스트를 상품명으로 사용
-            quantity_index = numeric_fields[0]["index"]
-
+            # 수량 왼쪽의 문자열을 상품명으로 사용
             name_parts = [
-                row["text"]
-                for row in group[:quantity_index]
+                r["text"]
+                for r in group[:quantity_field["index"]]
             ]
 
             product_name = " ".join(name_parts).strip()
@@ -3221,9 +3248,11 @@ def extract_receipt_items(ocr_result):
             if not re.search(r"[가-힣a-zA-Z]", product_name):
                 continue
 
-            # 6. 상품명에서 개당 용량과 단위 추출
+            # 상품명에서 개당 용량 추출
             amount_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*(ml|kg|g|l|매|개|롤|팩|장|입)(?![a-zA-Z가-힣])",
+                r"(\d+(?:\.\d+)?)\s*"
+                r"(ml|kg|g|l|매|개|롤|팩|장|입)"
+                r"(?![a-zA-Z가-힣])",
                 product_name,
                 re.IGNORECASE
             )
@@ -3231,12 +3260,8 @@ def extract_receipt_items(ocr_result):
             if amount_match:
                 amount_per_item = float(amount_match.group(1))
                 unit = amount_match.group(2).lower()
-
-                # 개당 용량 × 구매 수량
                 total_amount = amount_per_item * quantity
-
             else:
-                # 용량이 없는 경우 구매 수량 사용
                 unit = "개"
                 total_amount = float(quantity)
 
@@ -3247,7 +3272,16 @@ def extract_receipt_items(ocr_result):
                 "total_amount": total_amount
             })
 
-            return items
+            print(
+                "[OCR 상품 추출]",
+                product_name,
+                "수량:", quantity,
+                "총용량:", total_amount,
+                "단위:", unit,
+                flush=True
+            )
+
+    return items
 
 def extract_product_date(ocr_result):
     texts = []
