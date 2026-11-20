@@ -3234,11 +3234,12 @@ def extract_receipt_items(ocr_result):
 
                 # 개당 용량 × 구매 수량
                 total_amount = amount_per_item * quantity
-            else:
-                unit = None
-                total_amount = None
 
-            # 7. OCR 상품 결과 반환
+            else:
+                # 용량이 없는 경우 구매 수량 사용
+                unit = "개"
+                total_amount = float(quantity)
+
             items.append({
                 "product_name": product_name,
                 "quantity": quantity,
