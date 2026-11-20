@@ -2927,6 +2927,7 @@ async def upload_receipt(
                 detail="지원하지 않는 상품 분류 결과입니다."
             )
 
+
     # 9. 모달에 표시할 소비기한 / 예측 소진기한 계산
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
@@ -2981,98 +2982,107 @@ async def upload_receipt(
                 item["k_factor"] = k_factor
 
             except Exception as e:
-                print("생필품 소진일 예측 실패:", repr(e), flush=True)
+                print(
+                    "생필품 소진일 예측 실패:",
+                    repr(e),
+                    flush=True
+                )
 
                 item["product_date"] = today + timedelta(days=14)
                 item["expiration_source"] = "db_default"
                 item["predicted_days"] = None
                 item["k_factor"] = k_factor
-        # 9. OCR 결과 DB 저장
-        conn = None
 
-        try:
-            conn = get_connection()
+    # 10. OCR 결과 DB 저장
+    # 중요: 여기부터는 for item in items 반복문 바깥
 
-            with conn.cursor(DictCursor) as cursor:
+    conn = None
 
-                # 영수증 기록 생성
-                cursor.execute("""
-                    INSERT INTO receipts (
-                        user_id,
-                        image_path,
-                        ocr_status
-                    )
-                    VALUES (%s, %s, %s)
-                """, (
+    try:
+        conn = get_connection()
+
+        with conn.cursor(DictCursor) as cursor:
+
+            # 영수증 기록 생성
+            cursor.execute("""
+                INSERT INTO receipts (
                     user_id,
-                    None,
-                    "COMPLETED"
+                    image_path,
+                    ocr_status
+                )
+                VALUES (%s, %s, %s)
+            """, (
+                user_id,
+                None,
+                "COMPLETED"
+            ))
+
+            receipt_id = cursor.lastrowid
+
+            # OCR 상품 저장
+            for item in items:
+                cursor.execute("""
+                    INSERT INTO receipt_items (
+                        receipt_id,
+                        product_name,
+                        category,
+                        subcategory,
+                        product_date,
+                        quantity,
+                        total_amount,
+                        unit,
+                        expiration_source,
+                        predicted_days,
+                        k_factor
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    receipt_id,
+                    item["product_name"],
+                    item["category"],
+                    item["subcategory"],
+                    item["product_date"],
+                    item["quantity"],
+                    item["total_amount"],
+                    item["unit"],
+                    item["expiration_source"],
+                    item["predicted_days"],
+                    item["k_factor"]
                 ))
 
-                receipt_id = cursor.lastrowid
+                item["ocritem_id"] = cursor.lastrowid
 
-                # OCR 상품 저장
-                # OCR 상품 저장
-                # OCR 상품 저장
-                for item in items:
-                    cursor.execute("""
-                        INSERT INTO receipt_items (
-                            receipt_id,
-                            product_name,
-                            category,
-                            subcategory,
-                            product_date,
-                            quantity,
-                            total_amount,
-                            unit,
-                            expiration_source,
-                            predicted_days,
-                            k_factor
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        receipt_id,
-                        item["product_name"],
-                        item["category"],
-                        item["subcategory"],
-                        item["product_date"],
-                        item["quantity"],
-                        item["total_amount"],
-                        item["unit"],
-                        item["expiration_source"],
-                        item["predicted_days"],
-                        item["k_factor"]
-                    ))
-                    item["ocritem_id"] = cursor.lastrowid
+        # 모든 저장 작업이 성공하면 확정
+        conn.commit()
 
-            # 모든 저장 작업이 성공하면 확정
-            conn.commit()
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
 
-        except Exception as e:
-            if conn is not None:
-                conn.rollback()
+        print(
+            "OCR 결과 DB 저장 오류:",
+            repr(e),
+            flush=True
+        )
 
-            print("OCR 결과 DB 저장 오류:", repr(e), flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail="OCR 결과 저장 중 오류가 발생했습니다."
+        )
 
-            raise HTTPException(
-                status_code=500,
-                detail="OCR 결과 저장 중 오류가 발생했습니다."
-            )
+    finally:
+        if conn is not None:
+            conn.close()
 
-        finally:
-            if conn is not None:
-                conn.close()
-
-        # 10. 결과 반환
-        return {
-            "receipt_id": receipt_id,
-            "user_id": user_id,
-            "total": len(items),
-            "items": items,
-            "texts": texts,
-            "ocr_result": ocr_result
-        }
-
+    # 11. 결과 반환
+    return {
+        "receipt_id": receipt_id,
+        "user_id": user_id,
+        "total": len(items),
+        "items": items,
+        "texts": texts,
+        "ocr_result": ocr_result
+    }
 @app.post("/api/products/product_date_ocr")
 async def product_date_ocr(
     file: UploadFile = File(...),
