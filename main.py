@@ -26,6 +26,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+import cloudinary
+import cloudinary.uploader
 from google import genai
 from google.genai import types
 from typing import Literal
@@ -1001,7 +1003,6 @@ def delete_product(product_id: int,
         if conn is not None:
             conn.close()
 
-
 @app.get("/api/group_buy")
 def get_group_buy_list(region: str):
     conn = None
@@ -1055,6 +1056,7 @@ UPLOAD_DIR = Path("uploads/group-buy")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+
 @app.post("/api/group_buy", status_code=201)
 def create_group_buy(
     region: str = Form(...),
@@ -1068,32 +1070,28 @@ def create_group_buy(
 ):
     conn = None
     image_path = None
-    saved_file = None
+    cloudinary_public_id = None
 
     try:
-        # 1. 이미지 저장
+        # 1. Cloudinary에 이미지 저장
         if product_image is not None:
+
             allowed_types = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/webp": ".webp"
+                "image/jpeg",
+                "image/png",
+                "image/webp"
             }
 
-            extension = allowed_types.get(
-                product_image.content_type
-            )
-
-            if extension is None:
+            if product_image.content_type not in allowed_types:
                 raise HTTPException(
                     status_code=400,
                     detail="JPG, PNG, WEBP 이미지만 업로드할 수 있습니다."
                 )
 
-            filename = f"{uuid4().hex}{extension}"
-            saved_file = UPLOAD_DIR / filename
-
             # 최대 5MB 제한
-            image_data = product_image.file.read(5 * 1024 * 1024 + 1)
+            image_data = product_image.file.read(
+                5 * 1024 * 1024 + 1
+            )
 
             if len(image_data) > 5 * 1024 * 1024:
                 raise HTTPException(
@@ -1101,10 +1099,16 @@ def create_group_buy(
                     detail="이미지는 최대 5MB까지 업로드할 수 있습니다."
                 )
 
-            with open(saved_file, "wb") as f:
-                f.write(image_data)
+            # Cloudinary 업로드
+            upload_result = cloudinary.uploader.upload(
+                image_data,
+                folder="jangbaguni/group_buy",
+                resource_type="image"
+            )
 
-            image_path = f"/uploads/group-buy/{filename}"
+            # 이미지 URL과 삭제용 ID 저장
+            image_path = upload_result["secure_url"]
+            cloudinary_public_id = upload_result["public_id"]
 
         # 2. DB 연결
         conn = get_connection()
@@ -1157,6 +1161,7 @@ def create_group_buy(
                 VALUES (%s, %s)
             """, (buy_id, user_id))
 
+        # 5. DB 저장 확정
         conn.commit()
 
         return {
@@ -1177,15 +1182,46 @@ def create_group_buy(
     except HTTPException:
         if conn is not None:
             conn.rollback()
-        if saved_file is not None:
-            saved_file.unlink(missing_ok=True)
+
+        # DB 저장 실패 시 업로드한 이미지 삭제
+        if cloudinary_public_id is not None:
+            try:
+                cloudinary.uploader.destroy(
+                    cloudinary_public_id,
+                    resource_type="image"
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Cloudinary 이미지 삭제 실패:",
+                    repr(cleanup_error),
+                    flush=True
+                )
+
         raise
 
-    except Exception:
+    except Exception as e:
         if conn is not None:
             conn.rollback()
-        if saved_file is not None:
-            saved_file.unlink(missing_ok=True)
+
+        # DB 저장 실패 시 업로드한 이미지 삭제
+        if cloudinary_public_id is not None:
+            try:
+                cloudinary.uploader.destroy(
+                    cloudinary_public_id,
+                    resource_type="image"
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Cloudinary 이미지 삭제 실패:",
+                    repr(cleanup_error),
+                    flush=True
+                )
+
+        print(
+            "공동구매 글 작성 오류:",
+            repr(e),
+            flush=True
+        )
 
         raise HTTPException(
             status_code=500,
@@ -1195,8 +1231,11 @@ def create_group_buy(
     finally:
         if conn is not None:
             conn.close()
+
         if product_image is not None:
             product_image.file.close()
+
+
 
 
 @app.put("/api/group_buy/{buy_id}")
@@ -1210,10 +1249,12 @@ def update_group_buy(
     description: str = Form(""),
     product_image: UploadFile | None = File(None),
     user_id: int = Depends(get_current_user_id)
-
 ):
     conn = None
-    saved_file = None
+    image_path = None
+    cloudinary_public_id = None
+    old_cloudinary_public_id = None
+    committed = False
 
     try:
         conn = get_connection()
@@ -1258,21 +1299,19 @@ def update_group_buy(
                     detail="모집 인원을 현재 참여 인원보다 적게 설정할 수 없습니다."
                 )
 
-            # 4. 이미지 처리
+            # 4. 기존 이미지 유지
             image_path = post["product_image_path"]
 
+            # 새 이미지가 있으면 교체
             if product_image is not None:
+
                 allowed_types = {
-                    "image/jpeg": ".jpg",
-                    "image/png": ".png",
-                    "image/webp": ".webp"
+                    "image/jpeg",
+                    "image/png",
+                    "image/webp"
                 }
 
-                extension = allowed_types.get(
-                    product_image.content_type
-                )
-
-                if extension is None:
+                if product_image.content_type not in allowed_types:
                     raise HTTPException(
                         status_code=400,
                         detail="JPG, PNG, WEBP 이미지만 업로드할 수 있습니다."
@@ -1288,13 +1327,38 @@ def update_group_buy(
                         detail="이미지는 최대 5MB까지 업로드할 수 있습니다."
                     )
 
-                filename = f"{uuid4().hex}{extension}"
-                saved_file = UPLOAD_DIR / filename
+                # 새 이미지 Cloudinary 업로드
+                upload_result = cloudinary.uploader.upload(
+                    image_data,
+                    folder="jangbaguni/group_buy",
+                    resource_type="image"
+                )
 
-                with open(saved_file, "wb") as f:
-                    f.write(image_data)
+                image_path = upload_result["secure_url"]
+                cloudinary_public_id = upload_result["public_id"]
 
-                image_path = f"/uploads/group-buy/{filename}"
+                # 기존 이미지가 Cloudinary에 저장된 경우
+                # 삭제를 위한 public_id 추출
+                old_image_path = post["product_image_path"]
+
+                if (
+                    old_image_path
+                    and "res.cloudinary.com/" in old_image_path
+                    and "/image/upload/" in old_image_path
+                ):
+                    import re
+
+                    match = re.search(
+                        r"/image/upload/(?:v\d+/)?(.+)$",
+                        old_image_path
+                    )
+
+                    if match:
+                        old_cloudinary_public_id = re.sub(
+                            r"\.[^.]+$",
+                            "",
+                            match.group(1).split("?")[0]
+                        )
 
             # 5. 게시글 수정
             cursor.execute("""
@@ -1322,6 +1386,22 @@ def update_group_buy(
             ))
 
         conn.commit()
+        committed = True
+
+        # 6. DB 수정 성공 후 이전 Cloudinary 이미지 삭제
+        if old_cloudinary_public_id is not None:
+            try:
+                cloudinary.uploader.destroy(
+                    old_cloudinary_public_id,
+                    resource_type="image",
+                    invalidate=True
+                )
+            except Exception as cleanup_error:
+                print(
+                    "기존 Cloudinary 이미지 삭제 실패:",
+                    repr(cleanup_error),
+                    flush=True
+                )
 
         return {
             "buy_id": buy_id,
@@ -1339,20 +1419,47 @@ def update_group_buy(
         }
 
     except HTTPException:
-        if conn is not None:
+        if conn is not None and not committed:
             conn.rollback()
 
-        if saved_file is not None:
-            saved_file.unlink(missing_ok=True)
+        # DB 수정 실패 시 새로 업로드한 이미지 삭제
+        if not committed and cloudinary_public_id is not None:
+            try:
+                cloudinary.uploader.destroy(
+                    cloudinary_public_id,
+                    resource_type="image"
+                )
+            except Exception as cleanup_error:
+                print(
+                    "새 이미지 정리 실패:",
+                    repr(cleanup_error),
+                    flush=True
+                )
 
         raise
 
-    except Exception:
-        if conn is not None:
+    except Exception as e:
+        if conn is not None and not committed:
             conn.rollback()
 
-        if saved_file is not None:
-            saved_file.unlink(missing_ok=True)
+        if not committed and cloudinary_public_id is not None:
+            try:
+                cloudinary.uploader.destroy(
+                    cloudinary_public_id,
+                    resource_type="image"
+                )
+            except Exception as cleanup_error:
+                print(
+                    "새 이미지 정리 실패:",
+                    repr(cleanup_error),
+                    flush=True
+                )
+
+        print(
+            "공동구매 글 수정 오류:",
+            repr(e),
+            flush=True
+        )
 
         raise HTTPException(
             status_code=500,
