@@ -556,6 +556,24 @@ def get_products(
         conn = get_connection()
 
         with conn.cursor(DictCursor) as cursor:
+
+            # 현재 연결된 DB 확인
+            cursor.execute("""
+                SELECT DATABASE() AS db_name,
+                    @@hostname AS db_host,
+                    @@port AS db_port
+            """)
+            db_info = cursor.fetchone()
+
+            # 사용자별 상품 개수 확인
+            cursor.execute("""
+                SELECT user_id, COUNT(*) AS product_count
+                FROM products
+                GROUP BY user_id
+            """)
+            counts = cursor.fetchall()
+
+            # 로그인 사용자 상품 조회
             cursor.execute("""
                 SELECT *
                 FROM products
@@ -565,6 +583,12 @@ def get_products(
 
             products = cursor.fetchall()
 
+        print("========== PRODUCTS API DEBUG ==========", flush=True)
+        print("현재 로그인 user_id:", user_id, flush=True)
+        print("연결된 DB 정보:", db_info, flush=True)
+        print("사용자별 상품 개수:", counts, flush=True)
+        print("조회된 상품 개수:", len(products), flush=True)
+        print("========================================", flush=True)
         summary = {
             "expired_count": 0,
             "warning_count": 0,
@@ -614,7 +638,6 @@ def get_products(
         return {
             "total": len(products),
             "page": 1,
-            "limit": 20,
             "summary": summary,
             "products": products
         }
